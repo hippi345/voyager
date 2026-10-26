@@ -21,9 +21,9 @@ jobs:
       run:
         working-directory: java
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v7
       - name: Set up JDK 17
-        uses: actions/setup-java@v3
+        uses: actions/setup-java@v6
         with:
           java-version: '17'
           distribution: 'corretto'
@@ -35,7 +35,7 @@ jobs:
     continue-on-error: true
     name: Lint C++
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v7
       - name: Check C++ Formatting
         uses: jidicula/clang-format-action@v4.13.0
         with:
@@ -55,7 +55,7 @@ jobs:
           - macos-latest
     name: Test C++ on ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - name: Install CMake (Windows)
@@ -82,16 +82,18 @@ jobs:
         os: ['ubuntu-latest', windows-latest, macos-latest]
         java-version: ['11', '17']
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v7
       - name: Set up JDK ${{ matrix.java-version }}
-        uses: actions/setup-java@v3
+        uses: actions/setup-java@v6
         with:
           java-version: ${{ matrix.java-version }}
           distribution: 'corretto'
           gpg-private-key: ${{ secrets.SONATYPE_GPG_PRIVATE_KEY }}
-          gpg-passphrase: MAVEN_GPG_PASSPHRASE
-      - uses: ilammy/msvc-dev-cmd@v1
+          gpg-passphrase-env-var: MAVEN_GPG_PASSPHRASE
+      - name: Set up MSVC
         if: runner.os == 'Windows'
+        shell: pwsh
+        run: '& "$env:GITHUB_WORKSPACE/.github/scripts/setup-msvc.ps1"'
       - name: Compile
         run: make
       - name: Run Tests
@@ -109,14 +111,14 @@ jobs:
       matrix:
         java-version: ['11', '17']
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v7
       - name: Set up JDK ${{ matrix.java-version }}
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           java-version: ${{ matrix.java-version }}
           distribution: 'corretto'
           gpg-private-key: ${{ secrets.SONATYPE_GPG_PRIVATE_KEY }}
-          gpg-passphrase: MAVEN_GPG_PASSPHRASE
+          gpg-passphrase-env-var: MAVEN_GPG_PASSPHRASE
       - name: Compile
         env:
           USE_ASAN: "1"
@@ -145,10 +147,10 @@ jobs:
     name: Test with Python ${{ matrix.python-version }} on ${{ matrix.os }}
     steps:
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v3
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - name: Copy README into place
@@ -184,10 +186,10 @@ jobs:
     name: Test with Python ${{ matrix.python-version }} + Address Sanitizer
     steps:
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v3
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - name: Copy README into place
@@ -216,20 +218,17 @@ jobs:
           LD_PRELOAD=$(clang -print-file-name=libclang_rt.asan-x86_64.so) \
           tox
 
-  run-benchmarks:
-    strategy:
-      matrix:
-        os: ['ubuntu-latest']
-    runs-on: ${{ matrix.os }}
+  run-python-benchmarks:
+    runs-on: ubuntu-latest
     continue-on-error: true
     if: github.event_name == 'pull_request' 
-    name: Run benchmarks on ${{ matrix.os }}
+    name: Run Python benchmarks
     steps:
       - name: Set up Python
-        uses: actions/setup-python@v3
+        uses: actions/setup-python@v7
         with:
           python-version: '3.9'
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0 
           submodules: recursive
@@ -246,6 +245,81 @@ jobs:
              asv machine --yes
              asv continuous --sort name --no-only-changed refs/remotes/origin/main ${{ github.sha }} | tee >(sed '1,/All benchmarks:/d' > $GITHUB_STEP_SUMMARY)
 
+  run-java-benchmarks:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    if: github.event_name == 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        family: [Index, StringIndex]
+    name: Run Java benchmarks (${{ matrix.family }})
+    env:
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      PR_SHA: ${{ github.sha }}
+      BENCHMARK_FAMILY: ${{ matrix.family }}
+      BENCHMARK_FILTER: '^com[.]spotify[.]voyager[.]jni[.]${{ matrix.family }}(Creation|Query)Benchmark[.].*$'
+      # JMH needs at least three measurements to compute the comparison's error margins.
+      JMH_ARGS: "-f 1 -wi 2 -i 3 -w 1s -r 1s -foe true -jvmArgs '-Xms2g -Xmx2g'"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Set up JDK 17
+        uses: actions/setup-java@v6
+        with:
+          java-version: '17'
+          distribution: 'corretto'
+
+      - name: Check base benchmarks
+        id: baseline
+        run: |
+          if git ls-tree -r --name-only "$BASE_SHA" java/src/test/java | grep -Eq "/${BENCHMARK_FAMILY}(Creation|Query)Benchmark[.]java$"; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Measure both revisions on the same runner, with identical JMH settings.
+      - name: Checkout base branch
+        if: steps.baseline.outputs.available == 'true'
+        run: git checkout "$BASE_SHA"
+      - name: Build benchmarks (base)
+        if: steps.baseline.outputs.available == 'true'
+        working-directory: java
+        # Compile Java once, then build only the native library used by this runner.
+        run: |
+          make clean
+          mvn --batch-mode test-compile -Dexec.skip=true
+          make target/classes/linux-x64/libvoyager.so
+      - name: Run benchmarks (base)
+        if: steps.baseline.outputs.available == 'true'
+        working-directory: java
+        run: >-
+          mvn --batch-mode exec:exec -Dexec.executable=java -Dexec.classpathScope=test
+          -Dexec.args="-cp %classpath org.openjdk.jmh.Main $BENCHMARK_FILTER $JMH_ARGS -rf json -rff $RUNNER_TEMP/base-results.json"
+
+      - name: Checkout PR branch
+        # The base build regenerates tracked JNI headers; discard them in this CI checkout.
+        run: git checkout --force "$PR_SHA"
+      - name: Build benchmarks (PR)
+        working-directory: java
+        run: |
+          make clean
+          mvn --batch-mode test-compile -Dexec.skip=true
+          make target/classes/linux-x64/libvoyager.so
+      - name: Run benchmarks (PR)
+        working-directory: java
+        run: >-
+          mvn --batch-mode exec:exec -Dexec.executable=java -Dexec.classpathScope=test
+          -Dexec.args="-cp %classpath org.openjdk.jmh.Main $BENCHMARK_FILTER $JMH_ARGS -rf json -rff $RUNNER_TEMP/pr-results.json"
+
+      # Compare and report
+      - name: Compare benchmarks
+        run: >-
+          python3 java/scripts/compare_benchmarks.py
+          "$RUNNER_TEMP/base-results.json" "$RUNNER_TEMP/pr-results.json" >> "$GITHUB_STEP_SUMMARY"
+
   build-python-sdist:
     needs: [run-python-tests, run-python-tests-with-address-sanitizer]
     continue-on-error: false
@@ -253,10 +327,10 @@ jobs:
     if: true
     name: Build Python source distribution
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
-      - uses: actions/setup-python@v3
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.10"
       - name: Copy README into place
@@ -269,7 +343,7 @@ jobs:
       - name: Build source distribution
         working-directory: python
         run: python -m build --sdist --outdir ../dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           if-no-files-found: error
           name: python-sdist
@@ -286,31 +360,21 @@ jobs:
         - { os: macos-latest, build: cp39-macosx_x86_64 }
         - { os: macos-latest, build: cp310-macosx_x86_64 }
         - { os: macos-latest, build: cp311-macosx_x86_64 }
+        # cp312 builds ABI3 wheels that also support Python 3.13+. Building cp313
+        # separately produces duplicate filenames that race during artifact download.
         - { os: macos-latest, build: cp312-macosx_x86_64 }
-        - { os: macos-latest, build: cp313-macosx_x86_64 }
-        - { os: macos-latest, build: cp314-macosx_x86_64 }
-        - { os: macos-latest, build: cp315-macosx_x86_64 }
         - { os: macos-latest, build: cp39-macosx_universal2 }
         - { os: macos-latest, build: cp310-macosx_universal2 }
         - { os: macos-latest, build: cp311-macosx_universal2 }
         - { os: macos-latest, build: cp312-macosx_universal2 }
-        - { os: macos-latest, build: cp313-macosx_universal2 }
-        - { os: macos-latest, build: cp314-macosx_universal2 }
-        - { os: macos-latest, build: cp315-macosx_universal2 }
         - { os: macos-latest, build: cp39-macosx_arm64 }
         - { os: macos-latest, build: cp310-macosx_arm64 }
         - { os: macos-latest, build: cp311-macosx_arm64 }
         - { os: macos-latest, build: cp312-macosx_arm64 }
-        - { os: macos-latest, build: cp313-macosx_arm64 }
-        - { os: macos-latest, build: cp314-macosx_arm64 }
-        - { os: macos-latest, build: cp315-macosx_arm64 }
         - { os: windows-latest, build: cp39-win_amd64 }
         - { os: windows-latest, build: cp310-win_amd64 }
         - { os: windows-latest, build: cp311-win_amd64 }
         - { os: windows-latest, build: cp312-win_amd64 }
-        - { os: windows-latest, build: cp313-win_amd64 }
-        - { os: windows-latest, build: cp314-win_amd64 }
-        - { os: windows-latest, build: cp315-win_amd64 }
         - { os: 'ubuntu-latest', build: cp39-manylinux_x86_64 }
         - { os: 'ubuntu-latest', build: cp39-manylinux_aarch64 }
         - { os: 'ubuntu-latest', build: cp310-manylinux_x86_64 }
@@ -319,19 +383,13 @@ jobs:
         - { os: 'ubuntu-latest', build: cp311-manylinux_aarch64 }
         - { os: 'ubuntu-latest', build: cp312-manylinux_x86_64 }
         - { os: 'ubuntu-latest', build: cp312-manylinux_aarch64 }
-        - { os: 'ubuntu-latest', build: cp313-manylinux_x86_64 }
-        - { os: 'ubuntu-latest', build: cp313-manylinux_aarch64 }
-        - { os: 'ubuntu-latest', build: cp314-manylinux_x86_64 }
-        - { os: 'ubuntu-latest', build: cp314-manylinux_aarch64 }
-        - { os: 'ubuntu-latest', build: cp315-manylinux_x86_64 }
-        - { os: 'ubuntu-latest', build: cp315-manylinux_aarch64 }
     name: Build wheel for ${{ matrix.build }}
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       # Used to host cibuildwheel, so version doesn't really matter
-      - uses: actions/setup-python@v3
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.10"
       - name: Install cibuildwheel
@@ -340,7 +398,7 @@ jobs:
         run: cp README.md python/
       - name: Set up QEMU for aarch64 on Linux
         if: runner.os == 'Linux'
-        uses: docker/setup-qemu-action@v1
+        uses: docker/setup-qemu-action@v4
         with:
           platforms: all
       - name: Copy C++ code into place
@@ -365,7 +423,7 @@ jobs:
           CIBW_REPAIR_WHEEL_COMMAND_LINUX: pip install auditwheel-symbols && (auditwheel repair -w {dest_dir} {wheel} || auditwheel-symbols --manylinux 2010 {wheel})
           CIBW_TEST_SKIP: "*aarch64"
           MACOSX_DEPLOYMENT_TARGET: "10.14"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           if-no-files-found: error
           name: python-wheels-${{ matrix.build }}
@@ -383,28 +441,30 @@ jobs:
         os: ['ubuntu-latest', windows-latest, macos-latest]
         java-version: ['11']
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v7
       - name: Set up JDK ${{ matrix.java-version }}
-        uses: actions/setup-java@v3
+        uses: actions/setup-java@v6
         with:
           java-version: ${{ matrix.java-version }}
           distribution: 'corretto'
           gpg-private-key: ${{ secrets.SONATYPE_GPG_PRIVATE_KEY }}
-          gpg-passphrase: MAVEN_GPG_PASSPHRASE
+          gpg-passphrase-env-var: MAVEN_GPG_PASSPHRASE
       - name: Set up QEMU for aarch64 on Linux
         if: runner.os == 'Linux'
-        uses: docker/setup-qemu-action@v1
+        uses: docker/setup-qemu-action@v4
         with:
           platforms: all
-      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Set up MSVC
         if: runner.os == 'Windows'
+        shell: pwsh
+        run: '& "$env:GITHUB_WORKSPACE/.github/scripts/setup-msvc.ps1"'
       - name: Compile
         run: make
       - name: Package
         run: mvn --batch-mode package
         env:
           MAVEN_GPG_PASSPHRASE: ${{ secrets.SONATYPE_PASSPHRASE }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           if-no-files-found: error
           name: java-${{ matrix.os }}
@@ -415,7 +475,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-java-jars
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
       - name: Unpack and Repack JARs
@@ -447,7 +507,7 @@ jobs:
           objdump -T combined-jar/linux-x64/libvoyager.so | grep GLIBCXX | sed 's/.*GLIBCXX_\([.0-9]*\).*/\1/g' | cat - <(echo 3\.4\.22) | sort -Vu | tail -n 1 | grep 3\.4\.22  || (echo "Expected linux-x64 binary to require at most glibc++ 3.4.22. Ensure the dockcross container has not been updated." && false)
 
           zip -r $(ls java-* | grep jar | tail -n 1) combined-jar/*
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           if-no-files-found: error
           name: java-all-platforms
@@ -462,16 +522,16 @@ jobs:
     name: "Upload wheels and sdist to PyPI"
     if: github.event_name == 'release' && github.event.action == 'published'
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: python-wheels-*
           path: dist
           merge-multiple: true
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: python-sdist
           path: dist
-      - uses: pypa/gh-action-pypi-publish@v1.4.2
+      - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           user: __token__
           password: ${{ secrets.PYPI_DEPLOY_TOKEN }}
@@ -485,23 +545,21 @@ jobs:
       run:
         working-directory: java
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           name: java-all-platforms
           path: combined-jar
       - name: Set up JDK 11
-        uses: actions/setup-java@v3
+        uses: actions/setup-java@v6
         with:
           java-version: 11
           distribution: 'corretto'
-          server-id: ossrh
-          server-username: MAVEN_USERNAME
-          server-password: MAVEN_USER_TOKEN
-          gpg-private-key: ${{ secrets.SONATYPE_GPG_PRIVATE_KEY }}
-          gpg-passphrase: MAVEN_GPG_PASSPHRASE
+          server-id: central
+          server-username-env-var: MAVEN_USERNAME
+          server-password-env-var: MAVEN_USER_TOKEN
       - name: Deploy
-        # Note: this will re-run the build even though we already have the JAR file ready to deploy
+        # Repackage with all downloaded native libraries; skip rebuilding them on this runner.
         run: |
           # Copy the native artifacts built for each platform into the appropriate place:
           unzip ../combined-jar/*.jar -d ../
@@ -509,9 +567,10 @@ jobs:
           cp -r ../combined-jar/linux* target/classes/
           cp -r ../combined-jar/mac* target/classes/
           cp -r ../combined-jar/win* target/classes/
-          mvn --batch-mode deploy -Dmaven.test.skip=true
+          mvn --batch-mode deploy -Pcentral-publish -Dmaven.test.skip=true -Dexec.skip=true -Dgpg.signer=bc
         env:
+          # Central Portal user-token username and password (not legacy OSSRH credentials).
           MAVEN_USERNAME: ${{ secrets.SONATYPE_USERNAME }}
-          MAVEN_PASSWORD: ${{ secrets.SONATYPE_PASSWORD }}
+          MAVEN_GPG_KEY: ${{ secrets.SONATYPE_GPG_PRIVATE_KEY }}
           MAVEN_GPG_PASSPHRASE: ${{ secrets.SONATYPE_PASSPHRASE }}
           MAVEN_USER_TOKEN: ${{ secrets.SONATYPE_USER_TOKEN }}
